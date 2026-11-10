@@ -1119,19 +1119,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     reference_images: list[str] | None = None,
                     deadline=None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
-    preferred_id = getattr(engine, "current_acc_id", None)
-    if kind == "video" and not account_id:
-        # Prefer the last account that completed a video; session health alone is insufficient.
-        recent = sorted(list(store.tasks.values()), key=lambda task: task.get("created_at", 0), reverse=True)
-        for task in recent:
-            if task.get("kind") != "video" or task.get("status") != "completed" or not task.get("account"):
-                continue
-            candidate = store.get_account(task["account"])
-            if candidate and candidate.get("enabled", True) and candidate.get("ok") is not False:
-                preferred_id = candidate["id"]
-                break
     acc = ACCOUNT_POOL.acquire(account_id=account_id,
-                               preferred_id=preferred_id,
+                               preferred_id=None,
+                               rotate=True,
                                timeout=max(1, remaining_wait))
     cur_acc = acc
     last_exc = None
@@ -1594,7 +1584,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+    acc = store.pick_account(rotate=True)
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
@@ -1756,7 +1746,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+    acc = store.pick_account(rotate=True)
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
@@ -2328,12 +2318,12 @@ def _admin_html() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return _admin_html()
+    return HTMLResponse(_admin_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
-    return _admin_html()
+    return HTMLResponse(_admin_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 @app.get("/web", response_class=HTMLResponse)
@@ -2485,14 +2475,22 @@ def _warmup_browser_sync():
 
 
 async def _keepalive_loop():
-    """后台常驻守护任务：每 15 分钟轮询一次账号健康状态并保持 VM 热备。"""
+    """后台常驻守护任务：每 15 分钟轮询一次账号健康状态并保持 VM 热备，同时静默同步仓库更新。"""
     log.info("【自动保活守护进程】已启动，检测周期: 15 分钟")
     await asyncio.sleep(1)
+    try:
+        await asyncio.to_thread(_check_update_sync, True)
+    except Exception:
+        pass
     try:
         await asyncio.to_thread(_warmup_browser_sync)
     except Exception as e:  # noqa: BLE001
         log.warning("【浏览器预热】异常: %s", e)
     while True:
+        try:
+            await asyncio.to_thread(_check_update_sync, True)
+        except Exception:
+            pass
         try:
             await run_keepalive_all(force=False)
         except Exception as e:  # noqa: BLE001
@@ -2592,9 +2590,9 @@ def _ensure_git_repo(token: str = ""):
     _git(["config", "user.email", "czg86389-hub@users.noreply.github.com"])
 
 
-def _check_update_sync(force: bool = False) -> dict:
+def _check_update_sync(force: bool = False, _auto_upgrade: bool = False) -> dict:
     """检测 GitHub 官方仓库 (czg86389-hub/muse2api) 是否有新版本或新提交。
-    默认缓存 90 秒，防止频繁刷新触发 GitHub API 速率限制。"""
+    此部署只检测更新，不自动修改运行中的代码。"""
     now = time.time()
     if not force and _UPDATE_CACHE["data"] and (now - _UPDATE_CACHE["ts"]) < 90:
         return _UPDATE_CACHE["data"]
@@ -2606,10 +2604,17 @@ def _check_update_sync(force: bool = False) -> dict:
 
     has_git = os.path.isdir(os.path.join(BASE_DIR, ".git"))
     local_sha, local_msg, local_ts = "", "", 0
+    # A deployment branch has its own merge commits. Track the upstream base
+    # independently so the update status compares like with like.
+    try:
+        with open(os.path.join(BASE_DIR, "upstream-commit.txt"), encoding="utf-8") as f:
+            local_sha = f.read().strip()[:7]
+    except OSError:
+        pass
     if has_git:
         try:
             r_sha = _git(["rev-parse", "--short", "HEAD"])
-            if r_sha.returncode == 0:
+            if not local_sha and r_sha.returncode == 0:
                 local_sha = r_sha.stdout.strip()[:7]
             r_log = _git(["log", "-1", "--format=%s||%ct"])
             if r_log.returncode == 0 and "||" in r_log.stdout:
@@ -2692,12 +2697,14 @@ def _check_update_sync(force: bool = False) -> dict:
         except Exception:
             return (0,)
 
-    has_update = False
+    needs_upgrade = False
     if remote_sha and local_sha:
-        has_update = (remote_sha != local_sha)
+        needs_upgrade = (remote_sha != local_sha)
     elif remote_version and local_version:
-        has_update = _parse_v(remote_version) > _parse_v(local_version)
+        needs_upgrade = _parse_v(remote_version) > _parse_v(local_version)
 
+    # Railway deployments are updated through the fork; never overwrite the
+    # running container with the upstream archive or restart it from here.
     data = {
         "repo_url": REPO_URL,
         "has_git": has_git,
@@ -2709,8 +2716,8 @@ def _check_update_sync(force: bool = False) -> dict:
         "remote_sha": remote_sha,
         "remote_msg": remote_msg,
         "remote_time": remote_time,
-        "has_update": has_update,
-        "up_to_date": not has_update and bool(remote_sha or remote_version),
+        "has_update": needs_upgrade,
+        "up_to_date": not needs_upgrade and bool(remote_sha or remote_version),
         "highlights": highlights,
         "highlights_en": highlights_en,
         "recent_commits": recent_commits,
@@ -2766,7 +2773,7 @@ def _upgrade_from_github_sync() -> dict:
         upgraded_via = "tarball"
 
     _UPDATE_CACHE["ts"] = 0.0
-    status = _check_update_sync(force=True)
+    status = _check_update_sync(force=True, _auto_upgrade=False)
     if status.get("remote_sha"):
         try:
             with open(_installed_sha_file(), "w", encoding="utf-8") as f:
@@ -2794,19 +2801,8 @@ async def admin_check_update(force: bool = False):
 @app.post("/admin/update/upgrade")
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
-    """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
-    res = await asyncio.to_thread(_upgrade_from_github_sync)
-    restart = payload.get("restart", True) if isinstance(payload, dict) else True
-    if restart:
-        def _delayed_restart():
-            time.sleep(0.5)
-            try:
-                engine.stop()
-            except Exception:
-                pass
-            os._exit(0)
-        threading.Thread(target=_delayed_restart, daemon=True).start()
-    return res
+    """Keep local customizations intact; update the Railway branch instead."""
+    raise HTTPException(409, "此部署通过 GitHub 分支和 Railway 更新，请勿直接覆盖服务器代码。")
 
 
 @app.post("/admin/repo/push")
